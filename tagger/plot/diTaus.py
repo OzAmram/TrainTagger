@@ -22,8 +22,132 @@ style.set_style()
 from scipy.interpolate import interp1d
 
 #Imports from other modules
-from tagger.data.tools import extract_array, extract_nn_inputs, group_id_values
+from tagger.data.tools import extract_array, extract_nn_inputs, group_id_values, _split_flavor
 from common import MINBIAS_RATE, WPs_CMSSW, find_rate, plot_ratio, delta_r, eta_region_selection, get_bar_patch_data
+
+
+def my_split_flavor(data, cut):
+    """
+    Splits data by particle flavor and applies conditions for each category. Also creates the pT target.
+
+    Parameters:
+        data (awkward array): The input data to split.
+
+    Returns:
+        dict: A dictionary containing the split data by label.
+    """
+
+    genmatch_pt_base = data['jet_genmatch_pt'].array()[cut] > 0
+
+    # Define conditions for each label
+    conditions = {
+        "b": ( # Bottom
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 0) &
+            (data['jet_tauflav'].array()[cut] == 0) &
+            (data['jet_elflav'].array()[cut] == 0) &
+            (data['jet_genmatch_hflav'].array()[cut] == 5)
+        ),
+        "charm": ( # Charm
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 0) &
+            (data['jet_tauflav'].array()[cut] == 0) &
+            (data['jet_elflav'].array()[cut] == 0) &
+            (data['jet_genmatch_hflav'].array()[cut] == 4)
+        ),
+        "light": ( # uds
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 0) &
+            (data['jet_tauflav'].array()[cut] == 0) &
+            (data['jet_elflav'].array()[cut] == 0) &
+            (data['jet_genmatch_hflav'].array()[cut] == 0) &
+            ((abs(data['jet_genmatch_pflav'].array()[cut]) == 0) | (abs(data['jet_genmatch_pflav'].array()[cut]) == 1) | (abs(data['jet_genmatch_pflav'].array()[cut]) == 2) | (abs(data['jet_genmatch_pflav'].array()[cut]) == 3))
+        ),
+        "gluon": ( # Gluon
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 0) &
+            (data['jet_tauflav'].array()[cut] == 0) &
+            (data['jet_elflav'].array()[cut] == 0) &
+            (data['jet_genmatch_hflav'].array()[cut] == 0) &
+            (data['jet_genmatch_pflav'].array()[cut] == 21)
+        ),
+        "taup": ( # Tau +
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 0) &
+            (data['jet_tauflav'].array()[cut] == 1) &
+            (data['jet_taucharge'].array()[cut] > 0) &
+            (data['jet_elflav'].array()[cut] == 0)
+        ),
+        "taum": ( # Tau -
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 0) &
+            (data['jet_tauflav'].array()[cut] == 1) &
+            (data['jet_taucharge'].array()[cut] < 0) &
+            (data['jet_elflav'].array()[cut] == 0)
+        ),
+        "muon": ( # muon
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 1) &
+            (data['jet_tauflav'].array()[cut] == 0) &
+            (data['jet_elflav'].array()[cut] == 0)
+        ),
+        "electron": ( # electron
+            genmatch_pt_base &
+            (data['jet_muflav'].array()[cut] == 0) &
+            (data['jet_tauflav'].array()[cut] == 0) &
+            (data['jet_elflav'].array()[cut] == 1)
+        ),
+    }
+
+    # Automatically generate class labels based on the order of keys in conditions
+    class_labels = {label: idx for idx, label in enumerate(conditions)}
+
+    # Initialize the new array in data for numeric labels with default -1 for unmatched entries
+    data_class_labels= ak.full_like(data['jet_genmatch_pt'].array()[cut], -1)
+
+    # Assign numeric values based on conditions using awkward's where function
+    for label, condition in conditions.items():
+        data_class_labels = ak.where(condition, class_labels[label], data_class_labels)
+
+    return data_class_labels, class_labels
+
+def top2_em_seed(X, input_vars):
+    charged_flags = [
+        "isPhoton",
+        "isElectronPlus",
+        "isElectronMinus",
+        #"isMuonPlus",
+        #"isMuonMinus",
+        "isChargedHadronPlus",
+        "isChargedHadronMinus",
+    ]
+
+    idxs = [input_vars.index(var) for var in charged_flags]
+    is_em = np.zeros(X.shape[0], dtype=bool)
+
+    for idx in idxs:
+        #check if either of top 2 candidates pass, 
+        #ids are one hot encoded
+        #either_pass = (X[:,0,idx] + X[:,1,idx]) > 0
+        either_pass = X[:,0,idx]  > 0
+
+        is_em = is_em | either_pass
+
+    is_em = is_em.reshape(-1,1)
+    return is_em
+
+
+def tau_score(preds, class_labels):
+    tau_index = [class_labels['taup'], class_labels['taum']] #Tau positives and tau negatives
+    bkg_index = [class_labels['light'], class_labels['gluon']] #bkgs
+
+    tau = preds[:,tau_index[0]] + preds[:,tau_index[1]]
+    #bkg = 0.75 * preds[:,class_labels['gluon']] + 0.25 * preds[:,class_labels['light']]
+    bkg = preds[:,class_labels['gluon']]
+
+    return tau / (tau + bkg)
+    
+
 
 def pick_and_plot_ditau(rate_list, pt_list, nn_list, model_dir, target_rate = 28, RateRange = 1.0):
     """
@@ -106,6 +230,15 @@ def derive_diTaus_WPs(model_dir, minbias_path, target_rate=28, n_entries=100, tr
     raw_jet_eta = extract_array(minbias, 'jet_eta_phys', n_entries)
     raw_jet_phi = extract_array(minbias, 'jet_phi_phys', n_entries)
     raw_inputs = extract_nn_inputs(minbias, input_vars, n_entries=n_entries)
+    
+#    pt_cut = np.asarray(raw_jet_pt > 30)
+#    data_class_labels, cls_labels =  my_split_flavor(minbias, pt_cut)
+#    
+#    for label in cls_labels.keys():
+#        idx = cls_labels[label]
+#        print(label, np.mean(data_class_labels == idx))
+#
+
 
     #Count number of total event
     n_events = len(np.unique(raw_event_id))
@@ -133,7 +266,6 @@ def derive_diTaus_WPs(model_dir, minbias_path, target_rate=28, n_entries=100, tr
     input1, input2 = np.asarray(jet_nn_inputs[:, 0][cuts]), np.asarray(jet_nn_inputs[:, 1][cuts])
 
     #Get the NN predictions
-    tau_index = [class_labels['taup'], class_labels['taum']] #Tau positives and tau negatives
     pred_score1, ratio1 = model.predict(input1)
     pred_score2, ratio2 = model.predict(input2)
 
@@ -141,8 +273,8 @@ def derive_diTaus_WPs(model_dir, minbias_path, target_rate=28, n_entries=100, tr
     pt1 = pt1_uncorrected*(ratio1.flatten())
     pt2 = pt2_uncorrected*(ratio2.flatten())
 
-    tau_score1=pred_score1[:,tau_index[0]] + pred_score1[:,tau_index[1]]
-    tau_score2=pred_score2[:,tau_index[0]] + pred_score2[:,tau_index[1]]
+    tau_score1 = tau_score(pred_score1, class_labels)
+    tau_score2 = tau_score(pred_score2, class_labels)
 
     #Put them together
     NN_score = np.vstack([tau_score1, tau_score2]).transpose()
@@ -205,9 +337,8 @@ def plot_bkg_rate_ditau(model_dir, minbias_path, n_entries=500000, tree='jetntup
     nn_inputs = np.asarray(extract_nn_inputs(minbias, input_vars, n_entries=n_entries))
 
     #Get the NN predictions
-    tau_index = [class_labels['taup'], class_labels['taum']] #Tau positives and tau negatives
     pred_score, ratio = model.predict(nn_inputs[eta_selection])
-    model_tau = pred_score[:, tau_index[0]] + pred_score[:, tau_index[1]]
+    model_tau = tau_score(pred_score, class_labels)
 
     #Emulator tau score
     cmssw_tau = extract_array(minbias, 'jet_tauscore', n_entries)[eta_selection]
@@ -228,10 +359,13 @@ def plot_bkg_rate_ditau(model_dir, minbias_path, n_entries=500000, tree='jetntup
     else:
         raise Exception("Working point does not exist. Run with --deriveWPs first.")
     
+
+
     event_id_model = event_id[model_tau > tautau_wp]
 
     #Cut on jet pT to extract the rate
     jet_pt = extract_array(minbias, 'jet_pt', n_entries)[eta_selection]
+
 
     jet_pt_cmssw = extract_array(minbias, 'jet_taupt', n_entries)[eta_selection][cmssw_tau > WPs_CMSSW["tau"]]
     jet_pt_model = (jet_pt*ratio.flatten())[model_tau > tautau_wp]
@@ -346,7 +480,9 @@ def eff_ditau(model_dir, signal_path, eta_region='barrel', tree='jetntuple/Jets'
     nn_inputs = np.asarray(extract_nn_inputs(signal, input_vars, n_entries=n_entries))
     pred_score, ratio = model.predict(nn_inputs)
 
-    nn_tauscore_raw = pred_score[:,class_labels['taup'],] + pred_score[:,class_labels['taum']]
+    nn_tauscore_raw = tau_score(pred_score, class_labels) 
+    nn_bkgscore_raw = pred_score[:,class_labels['light'],] + pred_score[:,class_labels['gluon']]
+    nn_tauscore_raw = nn_tauscore_raw / (nn_bkgscore_raw + nn_tauscore_raw)
     nn_taupt_raw = np.multiply(l1_pt_raw, ratio.flatten())
 
     #selecting the eta region
@@ -434,8 +570,8 @@ if __name__ == "__main__":
 
     parser = ArgumentParser()
     parser.add_argument('-m','--model_dir', default='output/baseline', help = 'Input model')
-    parser.add_argument('-v', '--vbf_sample', default='/eos/cms/store/cmst3/group/l1tr/sewuchte/l1teg/fp_ntuples_v131Xv9/extendedTRK_5param_221124/VBFHtt_PU200.root' , help = 'Signal sample for VBF -> ditaus') 
-    parser.add_argument('--minbias', default='/eos/cms/store/cmst3/group/l1tr/sewuchte/l1teg/fp_ntuples_v131Xv9/extendedTRK_5param_221124/MinBias_PU200.root' , help = 'Minbias sample for deriving rates')    
+    parser.add_argument('-v', '--vbf_sample', default='/eos/cms/store/cmst3/group/l1tr/sewuchte/l1teg/fp_jettuples_090125_addGenH/VBFHToTauTau_PU200.root' , help = 'Signal sample for VBF -> ditaus') 
+    parser.add_argument('--minbias', default='/eos/cms/store/cmst3/group/l1tr/sewuchte/l1teg/fp_jettuples_090125/MinBias_PU200.root' , help = 'Minbias sample for deriving rates')    
 
     #Different modes
     parser.add_argument('--deriveWPs', action='store_true', help='derive the working points for di-taus')
